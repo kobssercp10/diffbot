@@ -1,35 +1,26 @@
 # differ.py
-# -----------------------------------------------------------
-# Single-call API:
-#   get_updates(token: str, save_to_json: bool) -> Optional[list]
-#
-# If save_to_json=True:
-#   - writes JSON to out/<uid>.json
-#   - returns None
-#
-# If save_to_json=False:
-#   - returns a list of Pyrogram TL objects (raw messages)
-#   - does not write any files
-#
-# Requires: pyrogram
-# -----------------------------------------------------------
+"""
+Fetch and persist all updates for a bot using MTProto GetDifference.
+Collects messages (excluding outgoing Message but including service messages),
+users, groups and channels with full information.
+"""
 
 import os
 import json
 import base64
 import asyncio
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from pyrogram import Client
 from pyrogram.errors import InternalServerError, Unauthorized
-
 from pyrogram.raw.functions.updates.get_difference import GetDifference
+from pyrogram.raw.types import Message
 from pyrogram.raw.types.updates.difference import Difference
 from pyrogram.raw.types.updates.difference_slice import DifferenceSlice
 from pyrogram.raw.types.updates.difference_empty import DifferenceEmpty
 from pyrogram.raw.types.updates.difference_too_long import DifferenceTooLong
 
-# --- App credentials (yours) ---
+# --- App credentials ---
 APP_ID = 28221462
 APP_HASH = "929b210afa6e5226caeb5ec9a80f64a9"
 
@@ -43,53 +34,46 @@ def _ensure_dirs() -> None:
     os.makedirs(OUT_DIR, exist_ok=True)
 
 
-def _to_jsonable(obj: Any) -> Any:
-    """
-    Best-effort conversion of Pyrogram raw TLObjects (and nested structures)
-    into JSON-serializable data. Bytes are base64-encoded. Adds '__type__'
-    to preserve the original class name for objects.
-    """
+def _jsonable(obj: Any) -> Any:
+    """Convert arbitrary objects (including TLObjects) into JSONable data."""
     from datetime import datetime
     from enum import Enum
 
     if obj is None or isinstance(obj, (str, int, float, bool)):
         return obj
-
     if isinstance(obj, bytes):
         return {"__bytes__": base64.b64encode(obj).decode("ascii")}
-
     if isinstance(obj, (list, tuple, set)):
-        return [_to_jsonable(x) for x in obj]
-
+        return [_jsonable(x) for x in obj]
     if isinstance(obj, dict):
-        return {str(k): _to_jsonable(v) for k, v in obj.items()}
-
+        return {str(k): _jsonable(v) for k, v in obj.items()}
     if isinstance(obj, datetime):
         return obj.isoformat()
-
     if isinstance(obj, Enum):
         return obj.name
-
-    # Try a dict-like view of custom objects (e.g., TLObjects)
-    # Keep only public attributes, annotate with type
     if hasattr(obj, "__dict__"):
         d = {k: v for k, v in obj.__dict__.items() if not k.startswith("_")}
         d["__type__"] = obj.__class__.__name__
-        return _to_jsonable(d)
-
-    # Fallback: string representation
+        return _jsonable(d)
     return repr(obj)
 
 
-async def _collect_diffs(token: str) -> Tuple[int, List[Any]]:
-    """
-    Connect with a bot token, page through GetDifference, and collect
-    all new_messages across slices.
-    Returns (uid, messages_list).
-    """
-    # Use the numeric bot ID as the session name to avoid collisions
-    session_name = str(token).split(":")[0]
+def _chunked(seq: Iterable[int], size: int) -> Iterable[List[int]]:
+    seq = list(seq)
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
 
+
+def _channel_to_chat_id(channel_id: int) -> int:
+    return int(f"-100{channel_id}")
+
+
+def _basicgroup_to_chat_id(chat_id: int) -> int:
+    return -int(chat_id)
+
+
+async def _fetch_diff(token: str) -> Tuple[int, Dict[str, Any]]:
+    session_name = str(token).split(":", 1)[0]
     async with Client(
         session_name,
         bot_token=token,
@@ -103,80 +87,143 @@ async def _collect_diffs(token: str) -> Tuple[int, List[Any]]:
         uid = me.id
 
         req = GetDifference(pts=1, date=1, qts=0)
-        collected: List[Any] = []
+        messages: List[Any] = []
+        new_encrypted: List[Any] = []
+        other_updates: List[Any] = []
+        chats_raw: List[Any] = []
+        users_raw: List[Any] = []
+        state = None
 
         while True:
             try:
                 diff = await client.invoke(req)
-                print(diff)
-                print(type(diff))
-                print("--------------")
             except InternalServerError:
-                # Transient server hiccup; just retry current req
                 continue
             except Unauthorized:
-                # Token revoked or invalid; return nothing for this uid
-                return uid, []
+                return uid, {}
 
             if isinstance(diff, DifferenceSlice):
-                # Accumulate messages
-                if diff.new_messages:
-                    collected.extend(diff.new_messages)
-
-                # Advance state
+                messages.extend(diff.new_messages or [])
+                new_encrypted.extend(diff.new_encrypted_messages or [])
+                other_updates.extend(diff.other_updates or [])
+                chats_raw.extend(diff.chats or [])
+                users_raw.extend(diff.users or [])
                 st = diff.intermediate_state
                 req.pts = st.pts
                 req.qts = st.qts
                 req.date = st.date
-
             elif isinstance(diff, Difference):
-                if diff.new_messages:
-                    collected.extend(diff.new_messages)
+                messages.extend(diff.new_messages or [])
+                new_encrypted.extend(diff.new_encrypted_messages or [])
+                other_updates.extend(diff.other_updates or [])
+                chats_raw.extend(diff.chats or [])
+                users_raw.extend(diff.users or [])
+                state = diff.state
                 break
-
             elif isinstance(diff, DifferenceTooLong):
-                # Server tells us to jump to a newer pts
                 req.pts = diff.pts
-
             elif isinstance(diff, DifferenceEmpty):
-                # Nothing more to do
+                state = getattr(diff, "state", None)
                 break
 
-        return uid, collected
+        # filter messages: remove outgoing simple messages
+        filtered: List[Any] = []
+        for m in messages:
+            if isinstance(m, Message) and m.out:
+                continue
+            filtered.append(m)
+
+        # collect ids to fetch full info
+        user_ids: Set[int] = set()
+        channel_ids: Set[int] = set()
+        chat_ids: Set[int] = set()
+
+        for msg in filtered:
+            peer = getattr(msg, "peer_id", None)
+            if peer is not None:
+                uid = getattr(peer, "user_id", None)
+                if isinstance(uid, int):
+                    user_ids.add(uid)
+                cid = getattr(peer, "channel_id", None)
+                if isinstance(cid, int):
+                    channel_ids.add(cid)
+                gid = getattr(peer, "chat_id", None)
+                if isinstance(gid, int):
+                    chat_ids.add(gid)
+
+        for u in users_raw:
+            user_ids.add(getattr(u, "id", 0))
+        for c in chats_raw:
+            cid = getattr(c, "id", None)
+            if isinstance(cid, int):
+                if getattr(c, "megagroup", False) or getattr(c, "gigagroup", False) or getattr(c, "broadcast", False):
+                    channel_ids.add(cid)
+                else:
+                    chat_ids.add(cid)
+
+        # fetch full users
+        full_users: List[Any] = []
+        for chunk in _chunked(sorted(user_ids), 100):
+            if not chunk:
+                continue
+            res = await client.get_users(chunk)
+            if not isinstance(res, list):
+                res = [res]
+            for u in res:
+                if hasattr(u, "_client"):
+                    delattr(u, "_client")
+                full_users.append(u)
+
+        # fetch full chats/channels
+        full_chats: List[Any] = []
+        for cid in sorted(channel_ids):
+            chat_id = _channel_to_chat_id(cid)
+            try:
+                c = await client.get_chat(chat_id)
+                if hasattr(c, "_client"):
+                    delattr(c, "_client")
+                full_chats.append(c)
+            except Exception:
+                continue
+        for gid in sorted(chat_ids):
+            chat_id = _basicgroup_to_chat_id(gid)
+            try:
+                c = await client.get_chat(chat_id)
+                if hasattr(c, "_client"):
+                    delattr(c, "_client")
+                full_chats.append(c)
+            except Exception:
+                continue
+
+        result = {
+            "_": "types.updates.Difference",
+            "new_messages": [_jsonable(m) for m in filtered],
+            "new_encrypted_messages": [_jsonable(m) for m in new_encrypted],
+            "other_updates": [_jsonable(u) for u in other_updates],
+            "chats": [_jsonable(c) for c in full_chats],
+            "users": [_jsonable(u) for u in full_users],
+            "state": _jsonable(state),
+        }
+
+        return uid, result
 
 
-async def get_updates_async(token: str, save_to_json: bool) -> Optional[List[Any]]:
-    """
-    Async entrypoint. If save_to_json=True, writes to OUT_DIR/<uid>.json and returns None.
-    Otherwise returns a list of raw Pyrogram TLObjects.
-    """
+async def get_updates_async(token: str, save_to_json: bool = True) -> Dict[str, Any]:
     _ensure_dirs()
-
-    uid, messages = await _collect_diffs(token)
-
-    if save_to_json:
-        # Serialize once at the end to avoid partial/corrupt files
+    uid, diff = await _fetch_diff(token)
+    if save_to_json and diff:
         out_path = os.path.join(OUT_DIR, f"{uid}.json")
         with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(_to_jsonable(messages), f, ensure_ascii=False)
-        return None
-
-    # Return the raw Pyrogram objects (variables/objects in memory)
-    return messages
+            json.dump(diff, f, ensure_ascii=False)
+    return diff
 
 
-def get_updates(token: str, save_to_json: bool) -> Optional[List[Any]]:
-    """
-    Sync wrapper. Call this from another script with only (token, bool).
-    If an event loop is already running, import and use `await get_updates_async(...)`.
-    """
+def get_updates(token: str, save_to_json: bool = True) -> Dict[str, Any]:
     try:
         return asyncio.run(get_updates_async(token, save_to_json))
     except RuntimeError as e:
-        # Helpful message if called from within a running loop (e.g., FastAPI, Jupyter)
         if "asyncio.run()" in str(e):
             raise RuntimeError(
-                "An asyncio event loop is already running. "
-                "Use: `await get_updates_async(token, save_to_json)`."
+                "An asyncio event loop is already running. Use: `await get_updates_async(token, save_to_json)`."
             ) from e
         raise
