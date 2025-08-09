@@ -1,10 +1,9 @@
 # loader.py
 import os
 import json
-import pyrogram
-from typing import List, Any
+from typing import Any, Dict, List
 
-from .differ import get_updates, get_updates_async, OUT_DIR  # re-use your module
+from .differ import OUT_DIR, get_updates_async, _deserialize
 
 def bot_uid_from_token(token: str) -> str:
     t = token.strip()
@@ -12,34 +11,24 @@ def bot_uid_from_token(token: str) -> str:
         t = t[3:]
     return t.split(":", 1)[0]
 
-async def load_messages(token: str, new=False) -> List[Any]:
-    """
-    Ensures JSON exists for the token (generates via get_updates if missing),
-    loads it, then reconstructs TL objects via your eval(eval(...)) approach.
-    Returns a flat list of TL objects (e.g., pyrogram.raw.types.Message).
-    """
+async def load_difference(token: str, new: bool = False) -> Dict[str, Any]:
+    """Load previously dumped updates for a bot token."""
+
     uid = bot_uid_from_token(token)
     os.makedirs(OUT_DIR, exist_ok=True)
     json_path = os.path.join(OUT_DIR, f"{uid}.json")
 
-    if os.path.isfile(json_path) and not new:
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    else:
+    if not os.path.isfile(json_path) or new:
         await get_updates_async(token, save_to_json=True)
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
 
-    messages = []
-    for item in (data or []):
-        try:
-            obj = eval(eval(json.dumps(item, ensure_ascii=False)))
-            if isinstance(obj, list):
-                messages.extend(obj)
-            else:
-                messages.append(obj)
-        except Exception:
-            print("***** Skipping invalid message *****")
-            continue
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-    return messages
+    return _deserialize(data)
+
+
+async def load_messages(token: str, new: bool = False) -> List[Any]:
+    """Convenience wrapper returning only ``new_messages``."""
+
+    diff = await load_difference(token, new)
+    return diff.get("new_messages", [])
