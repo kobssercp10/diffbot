@@ -1,45 +1,47 @@
-# loader.py
-import os
-import json
-import pyrogram
-from typing import List, Any
+"""Utility helpers for reading the saved update JSON files."""
 
-from .differ import get_updates, get_updates_async, OUT_DIR  # re-use your module
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from typing import Any, Dict
+
+from .differ import OUT_DIR, get_updates_async
+
 
 def bot_uid_from_token(token: str) -> str:
+    """Extract the numeric identifier from a bot token."""
+
     t = token.strip()
     if t.startswith("bot"):
         t = t[3:]
     return t.split(":", 1)[0]
 
-async def load_messages(token: str, new=False) -> List[Any]:
+
+async def load_updates(token: str, new: bool = False) -> Dict[str, Any]:
+    """Load the saved difference for ``token``.
+
+    When ``new`` is ``True`` or the file does not yet exist the latest
+    updates are fetched from Telegram first.
     """
-    Ensures JSON exists for the token (generates via get_updates if missing),
-    loads it, then reconstructs TL objects via your eval(eval(...)) approach.
-    Returns a flat list of TL objects (e.g., pyrogram.raw.types.Message).
-    """
+
     uid = bot_uid_from_token(token)
+    path = os.path.join(OUT_DIR, f"{uid}.json")
     os.makedirs(OUT_DIR, exist_ok=True)
-    json_path = os.path.join(OUT_DIR, f"{uid}.json")
 
-    if os.path.isfile(json_path) and not new:
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    else:
+    if new or not os.path.isfile(path):
         await get_updates_async(token, save_to_json=True)
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
 
-    messages = []
-    for item in (data or []):
-        try:
-            obj = eval(eval(json.dumps(item, ensure_ascii=False)))
-            if isinstance(obj, list):
-                messages.extend(obj)
-            else:
-                messages.append(obj)
-        except Exception:
-            print("***** Skipping invalid message *****")
-            continue
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-    return messages
+
+def load_updates_sync(token: str, new: bool = False) -> Dict[str, Any]:
+    """Synchronous wrapper around :func:`load_updates`."""
+
+    return asyncio.run(load_updates(token, new=new))
+
+
+__all__ = ["load_updates", "load_updates_sync", "bot_uid_from_token"]
+
