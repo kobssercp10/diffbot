@@ -105,3 +105,9 @@ venv.bak/
 
 # pycharm
 .idea/
+
+*.session
+/out
+/sessions
+/test.py
+/tokens.txt

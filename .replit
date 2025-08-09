@@ -1,0 +1,9 @@
+modules = ["python-3.11", "python-3.12"]
+run = "python -m src"
+
+[nix]
+channel = "stable-25_05"
+packages = ["nano"]
+
+[deployment]
+run = ["sh", "-c", "python -m src"]
